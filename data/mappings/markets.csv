@@ -1,0 +1,3 @@
+canonical_event_id,canonical_outcome,venue,market_id,token_id,question,confidence,verified
+example_replace_me,YES,kalshi,REPLACE_WITH_KALSHI_TICKER,,Replace with the exact same YES proposition,1.0,false
+example_replace_me,YES,polymarket,REPLACE_WITH_GAMMA_MARKET_ID,REPLACE_WITH_YES_TOKEN_ID,Replace with the exact same YES proposition,1.0,false
