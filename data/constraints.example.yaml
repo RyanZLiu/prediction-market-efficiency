@@ -1,0 +1,21 @@
+variables:
+  knicks_championship: 0.31
+  knicks_east: 0.29
+  knicks_playoffs: 0.80
+  total_over_210_5: 0.74
+  total_over_215_5: 0.66
+  total_over_220_5: 0.57
+  total_over_225_5: 0.60
+
+constraints:
+  - name: title_implies_conference
+    kind: subset
+    variables: [knicks_championship, knicks_east]
+
+  - name: conference_implies_playoffs
+    kind: subset
+    variables: [knicks_east, knicks_playoffs]
+
+  - name: total_threshold_monotonicity
+    kind: monotonic_desc
+    variables: [total_over_210_5, total_over_215_5, total_over_220_5, total_over_225_5]
