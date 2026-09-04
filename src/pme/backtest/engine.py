@@ -26,7 +26,10 @@ class PaperBacktester:
         for opp in sorted(opportunities, key=lambda x: x.timestamp):
             if opp.net_edge < self.config.min_net_edge:
                 continue
-            if opp.available_size is not None and opp.available_size < self.config.min_available_size:
+            if (
+                opp.available_size is not None
+                and opp.available_size < self.config.min_available_size
+            ):
                 continue
             key = (opp.canonical_event_id, opp.canonical_outcome)
             previous = last_trade.get(key)
@@ -39,17 +42,19 @@ class PaperBacktester:
                 continue
             locked_cost = opp.buy_price + opp.hedge_no_price + opp.estimated_cost
             pnl = opp.net_edge * quantity
-            trades.append(PaperTrade(
-                timestamp=opp.timestamp,
-                canonical_event_id=opp.canonical_event_id,
-                canonical_outcome=opp.canonical_outcome,
-                quantity=quantity,
-                gross_edge=opp.gross_edge,
-                net_edge=opp.net_edge,
-                locked_cost_per_contract=locked_cost,
-                pnl=pnl,
-                buy_venue=opp.buy_venue,
-                hedge_venue=opp.hedge_venue,
-            ))
+            trades.append(
+                PaperTrade(
+                    timestamp=opp.timestamp,
+                    canonical_event_id=opp.canonical_event_id,
+                    canonical_outcome=opp.canonical_outcome,
+                    quantity=quantity,
+                    gross_edge=opp.gross_edge,
+                    net_edge=opp.net_edge,
+                    locked_cost_per_contract=locked_cost,
+                    pnl=pnl,
+                    buy_venue=opp.buy_venue,
+                    hedge_venue=opp.hedge_venue,
+                )
+            )
             last_trade[key] = opp.timestamp
         return trades

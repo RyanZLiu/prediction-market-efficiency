@@ -57,7 +57,7 @@ class PolymarketClient(MarketDataClient):
             headers={"User-Agent": settings.user_agent},
         )
 
-    async def __aenter__(self) -> "PolymarketClient":
+    async def __aenter__(self) -> PolymarketClient:
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -73,7 +73,11 @@ class PolymarketClient(MarketDataClient):
         while len(results) < limit:
             response = await self.client.get(
                 f"{self.gamma_url}/markets",
-                params={"limit": min(page_size, limit - len(results)), "offset": offset, "closed": "false"},
+                params={
+                    "limit": min(page_size, limit - len(results)),
+                    "offset": offset,
+                    "closed": "false",
+                },
             )
             response.raise_for_status()
             rows = response.json()
@@ -119,7 +123,9 @@ class PolymarketClient(MarketDataClient):
 
     async def get_orderbook(self, market_id: str, token_id: str | None = None) -> OrderBook:
         if not token_id:
-            raise ValueError("Polymarket order books require the YES token_id from market discovery/mapping.")
+            raise ValueError(
+                "Polymarket order books require the YES token_id from market discovery/mapping."
+            )
         response = await self.client.get(f"{self.clob_url}/book", params={"token_id": token_id})
         response.raise_for_status()
         payload = response.json()

@@ -6,7 +6,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-import pandas as pd
 import plotly.express as px
 import streamlit as st
 
@@ -34,7 +33,12 @@ SELECT
 """).fetchone()
 
 cols = st.columns(5)
-for col, label, value in zip(cols, ["Markets", "Verified mappings", "Quotes", "Opportunities", "Paper trades"], counts):
+for col, label, value in zip(
+    cols,
+    ["Markets", "Verified mappings", "Quotes", "Opportunities", "Paper trades"],
+    counts,
+    strict=True,
+):
     col.metric(label, f"{value:,}")
 
 st.subheader("Latest mapped quotes")
@@ -75,7 +79,10 @@ if trades.empty:
     st.info("Run `pme backtest` after storing opportunities.")
 else:
     trades["cumulative_pnl"] = trades["pnl"].cumsum()
-    st.plotly_chart(px.line(trades, x="timestamp", y="cumulative_pnl", title="Cumulative simulated P&L"), use_container_width=True)
+    st.plotly_chart(
+        px.line(trades, x="timestamp", y="cumulative_pnl", title="Cumulative simulated P&L"),
+        use_container_width=True,
+    )
     st.dataframe(trades.tail(100), use_container_width=True, hide_index=True)
 
 db.close()
@@ -91,7 +98,9 @@ try:
     """).df()
     sb.close()
     if sportsbook.empty:
-        st.caption("No sportsbook data stored. Optional: set ODDS_API_KEY and run `pme collect-odds`.")
+        st.caption(
+            "No sportsbook data stored. Optional: set ODDS_API_KEY and run `pme collect-odds`."
+        )
     else:
         st.dataframe(sportsbook.head(200), use_container_width=True, hide_index=True)
 except Exception:

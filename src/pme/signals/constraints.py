@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping
+from collections.abc import Mapping
 
 from pme.models import ConstraintKind, ConstraintViolation, ProbabilityConstraint
 
@@ -33,7 +33,9 @@ def evaluate_constraints(
             magnitude = max([0.0, *[vals[i + 1] - vals[i] for i in range(len(vals) - 1)]])
             message = "Sequence must be non-increasing"
         if magnitude > c.tolerance:
-            violations.append(ConstraintViolation(constraint=c, magnitude=magnitude, message=message))
+            violations.append(
+                ConstraintViolation(constraint=c, magnitude=magnitude, message=message)
+            )
     return violations
 
 
@@ -45,7 +47,9 @@ def repair_prices(
     try:
         import cvxpy as cp
     except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("CVXPY is required for price repair. Install project dependencies.") from exc
+        raise RuntimeError(
+            "CVXPY is required for price repair. Install project dependencies."
+        ) from exc
 
     names = list(prices)
     index = {name: i for i, name in enumerate(names)}
@@ -66,7 +70,7 @@ def repair_prices(
         elif c.kind == ConstraintKind.EXHAUSTIVE:
             rules.append(cp.sum(x[ids]) == 1)
         elif c.kind == ConstraintKind.MONOTONIC_DESC:
-            for left, right in zip(ids, ids[1:]):
+            for left, right in zip(ids, ids[1:], strict=False):
                 rules.append(x[left] >= x[right])
 
     problem = cp.Problem(objective, rules)

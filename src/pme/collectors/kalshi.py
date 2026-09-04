@@ -36,7 +36,7 @@ class KalshiClient(MarketDataClient):
             headers={"User-Agent": settings.user_agent},
         )
 
-    async def __aenter__(self) -> "KalshiClient":
+    async def __aenter__(self) -> KalshiClient:
         return self
 
     async def __aexit__(self, *_: object) -> None:

@@ -61,17 +61,19 @@ def suggest_matches(
             score, text, date, category = score_pair(k, p)
             if score < threshold:
                 continue
-            candidates.append(MatchSuggestion(
-                kalshi_market_id=k.market_id,
-                polymarket_market_id=p.market_id,
-                polymarket_token_id=p.token_id,
-                kalshi_question=k.question,
-                polymarket_question=p.question,
-                score=score,
-                text_score=text,
-                date_score=date,
-                category_score=category,
-            ))
+            candidates.append(
+                MatchSuggestion(
+                    kalshi_market_id=k.market_id,
+                    polymarket_market_id=p.market_id,
+                    polymarket_token_id=p.token_id,
+                    kalshi_question=k.question,
+                    polymarket_question=p.question,
+                    score=score,
+                    text_score=text,
+                    date_score=date,
+                    category_score=category,
+                )
+            )
         candidates.sort(key=lambda x: x.score, reverse=True)
         suggestions.extend(candidates[:3])
     suggestions.sort(key=lambda x: x.score, reverse=True)

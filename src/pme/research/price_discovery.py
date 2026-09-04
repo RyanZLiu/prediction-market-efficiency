@@ -52,7 +52,7 @@ def convergence_episodes(
     episodes: list[ConvergenceEpisode] = []
     start: datetime | None = None
     max_gap = 0.0
-    for ts, gap in zip(timestamps, gaps):
+    for ts, gap in zip(timestamps, gaps, strict=True):
         absolute = abs(gap)
         if start is None and absolute >= entry_threshold:
             start = ts
@@ -60,12 +60,14 @@ def convergence_episodes(
         elif start is not None:
             max_gap = max(max_gap, absolute)
             if absolute <= exit_threshold:
-                episodes.append(ConvergenceEpisode(
-                    start=start,
-                    end=ts,
-                    duration_seconds=(ts - start).total_seconds(),
-                    max_gap=max_gap,
-                ))
+                episodes.append(
+                    ConvergenceEpisode(
+                        start=start,
+                        end=ts,
+                        duration_seconds=(ts - start).total_seconds(),
+                        max_gap=max_gap,
+                    )
+                )
                 start = None
                 max_gap = 0.0
     return episodes

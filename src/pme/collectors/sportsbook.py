@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -25,9 +24,11 @@ class OddsApiClient:
         if not self.api_key:
             raise ValueError("Set ODDS_API_KEY to use sportsbook ingestion.")
         self.base_url = (base_url or settings.odds_api_base_url).rstrip("/")
-        self.client = httpx.AsyncClient(timeout=settings.http_timeout, headers={"User-Agent": settings.user_agent})
+        self.client = httpx.AsyncClient(
+            timeout=settings.http_timeout, headers={"User-Agent": settings.user_agent}
+        )
 
-    async def __aenter__(self) -> "OddsApiClient":
+    async def __aenter__(self) -> OddsApiClient:
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -64,21 +65,25 @@ class OddsApiClient:
                     outcomes = market.get("outcomes", [])
                     raw_probs = [american_to_implied(float(o["price"])) for o in outcomes]
                     fair_probs = devig_probabilities(raw_probs) if raw_probs else []
-                    for outcome, implied, fair in zip(outcomes, raw_probs, fair_probs):
-                        quotes.append(SportsbookQuote(
-                            timestamp=now,
-                            sport_key=str(event.get("sport_key", sport_key)),
-                            event_id=str(event["id"]),
-                            commence_time=_dt(event.get("commence_time")),
-                            home_team=event.get("home_team"),
-                            away_team=event.get("away_team"),
-                            bookmaker=str(book.get("key") or book.get("title")),
-                            market_key=str(market.get("key")),
-                            outcome=str(outcome.get("name")),
-                            american_odds=float(outcome["price"]),
-                            point=float(outcome["point"]) if outcome.get("point") is not None else None,
-                            implied_probability=implied,
-                            fair_probability=fair,
-                            metadata={"event": event, "bookmaker": book.get("title")},
-                        ))
+                    for outcome, implied, fair in zip(outcomes, raw_probs, fair_probs, strict=True):
+                        quotes.append(
+                            SportsbookQuote(
+                                timestamp=now,
+                                sport_key=str(event.get("sport_key", sport_key)),
+                                event_id=str(event["id"]),
+                                commence_time=_dt(event.get("commence_time")),
+                                home_team=event.get("home_team"),
+                                away_team=event.get("away_team"),
+                                bookmaker=str(book.get("key") or book.get("title")),
+                                market_key=str(market.get("key")),
+                                outcome=str(outcome.get("name")),
+                                american_odds=float(outcome["price"]),
+                                point=float(outcome["point"])
+                                if outcome.get("point") is not None
+                                else None,
+                                implied_probability=implied,
+                                fair_probability=fair,
+                                metadata={"event": event, "bookmaker": book.get("title")},
+                            )
+                        )
         return quotes
