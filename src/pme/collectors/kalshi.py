@@ -80,7 +80,7 @@ class KalshiClient(MarketDataClient):
             market_type=MarketType.BINARY,
             start_time=_dt(row.get("open_time")),
             close_time=_dt(row.get("close_time")),
-            active=row.get("status") == "open",
+            active=str(row.get("status") or "").lower() in {"active", "open"},
             volume=_f(row.get("volume_fp") or row.get("volume")),
             liquidity=None,
             metadata=row,
@@ -90,6 +90,63 @@ class KalshiClient(MarketDataClient):
         response = await self.client.get(f"{self.base_url}/markets/{ticker}")
         response.raise_for_status()
         return response.json()["market"]
+
+    async def get_series(self, series_ticker: str) -> dict[str, Any]:
+        response = await self.client.get(f"{self.base_url}/series/{series_ticker}")
+        response.raise_for_status()
+        return response.json()["series"]
+
+    async def get_event(self, event_ticker: str) -> dict[str, Any]:
+        response = await self.client.get(f"{self.base_url}/events/{event_ticker}")
+        response.raise_for_status()
+        payload = response.json()
+        event = payload.get("event")
+        if not isinstance(event, dict):
+            raise ValueError("Unexpected Kalshi event response")
+        return event
+
+    async def get_executable_book(self, market_id: str) -> dict[str, Any]:
+        """Return executable YES/NO top-of-book prices and sizes.
+
+        Kalshi's orderbook contains YES bids and NO bids. A NO bid at p is an
+        executable YES ask at 1-p with the same size; a YES bid at p is an
+        executable NO ask at 1-p with the same size.
+        """
+
+        response = await self.client.get(
+            f"{self.base_url}/markets/{market_id}/orderbook",
+            params={"depth": 1},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        book = payload.get("orderbook_fp") or payload.get("orderbook") or {}
+        yes_levels = book.get("yes_dollars") or []
+        no_levels = book.get("no_dollars") or []
+
+        yes_best = max(
+            ((float(row[0]), float(row[1])) for row in yes_levels if len(row) >= 2),
+            default=None,
+            key=lambda item: item[0],
+        )
+        no_best = max(
+            ((float(row[0]), float(row[1])) for row in no_levels if len(row) >= 2),
+            default=None,
+            key=lambda item: item[0],
+        )
+
+        return {
+            "timestamp": utcnow(),
+            "market_id": market_id,
+            "yes_bid": None if yes_best is None else yes_best[0],
+            "yes_bid_size": None if yes_best is None else yes_best[1],
+            "yes_ask": None if no_best is None else 1.0 - no_best[0],
+            "yes_ask_size": None if no_best is None else no_best[1],
+            "no_bid": None if no_best is None else no_best[0],
+            "no_bid_size": None if no_best is None else no_best[1],
+            "no_ask": None if yes_best is None else 1.0 - yes_best[0],
+            "no_ask_size": None if yes_best is None else yes_best[1],
+            "raw": payload,
+        }
 
     async def get_orderbook(
         self, market_id: str, token_id: str | None = None, depth: int = 0
@@ -110,7 +167,6 @@ class KalshiClient(MarketDataClient):
             OrderBookLevel(price=float(price), size=float(size))
             for price, size, *_ in book.get("no_dollars", [])
         ]
-        # In a binary book, a NO bid at p is a YES ask at 1-p.
         yes_asks = [OrderBookLevel(price=1.0 - level.price, size=level.size) for level in no_bids]
         return OrderBook(
             timestamp=utcnow(),
@@ -123,7 +179,6 @@ class KalshiClient(MarketDataClient):
 
     async def get_quote(self, market_id: str, token_id: str | None = None) -> Quote:
         del token_id
-        # Market endpoint already exposes BBO fields. Fall back to the order book if needed.
         row = await self.get_market(market_id)
         bid = _f(row.get("yes_bid_dollars"))
         ask = _f(row.get("yes_ask_dollars"))

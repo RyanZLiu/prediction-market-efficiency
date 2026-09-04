@@ -24,6 +24,44 @@ class Database:
 
     def init(self) -> None:
         self.conn.execute(SCHEMA_SQL)
+        self._migrate_live_schema()
+
+    def _migrate_live_schema(self) -> None:
+        """Add executable-alert columns to databases created by older versions."""
+        existing = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info('arbitrage_alerts')").fetchall()
+        }
+        columns = {
+            "direction": "VARCHAR",
+            "leg1_side": "VARCHAR",
+            "leg2_side": "VARCHAR",
+            "leg1_price": "DOUBLE",
+            "leg2_price": "DOUBLE",
+            "leg1_size": "DOUBLE",
+            "leg2_size": "DOUBLE",
+            "quantity": "DOUBLE",
+            "leg1_fee": "DOUBLE",
+            "leg2_fee": "DOUBLE",
+            "total_cost": "DOUBLE",
+            "payout": "DOUBLE",
+            "net_profit": "DOUBLE",
+            "net_roi": "DOUBLE",
+            "kalshi_quote_age": "DOUBLE",
+            "polymarket_quote_age": "DOUBLE",
+            "quote_skew": "DOUBLE",
+            "verification_latency": "DOUBLE",
+            "match_confidence": "DOUBLE",
+            "rules_verified": "BOOLEAN",
+            "books_verified": "BOOLEAN",
+            "fees_verified": "BOOLEAN",
+            "metadata_json": "VARCHAR",
+        }
+        for name, sql_type in columns.items():
+            if name not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE arbitrage_alerts ADD COLUMN {name} {sql_type}"
+                )
 
     def upsert_markets(self, markets: Iterable[Market]) -> int:
         rows = list(markets)
@@ -122,6 +160,37 @@ class Database:
                     m.verified,
                 ],
             )
+        return len(rows)
+
+    def replace_auto_mappings(self, mappings: Iterable[MarketMapping]) -> int:
+        """Atomically replace mappings created by automatic discovery.
+
+        Manual/imported mappings are preserved. Automatic mappings use the
+        ``auto_`` canonical event prefix, so stale or closed auto-discovered
+        pairs do not remain subscribed forever.
+        """
+        rows = list(mappings)
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self.conn.execute("DELETE FROM mappings WHERE canonical_event_id LIKE 'auto_%'")
+            for m in rows:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO mappings VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        m.canonical_event_id,
+                        m.canonical_outcome,
+                        m.venue.value,
+                        m.market_id,
+                        m.token_id,
+                        m.question,
+                        m.confidence,
+                        m.verified,
+                    ],
+                )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
         return len(rows)
 
     def insert_opportunities(self, opportunities: Iterable[Opportunity]) -> int:

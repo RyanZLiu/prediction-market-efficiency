@@ -12,3 +12,10 @@ data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+
+# Local upgrade/install backups
+.live_arbitrage_backup_*/
+.pme-backup-*/
+
+# Local extracted feature bundles
+pme_live_arbitrage_feature/

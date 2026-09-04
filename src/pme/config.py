@@ -36,11 +36,28 @@ class Settings:
         else None
     )
 
+    # Polymarket US public market-data API. No key is required for REST reads.
+    polymarket_us_gateway_url: str = os.getenv(
+        "POLYMARKET_US_GATEWAY_URL", "https://gateway.polymarket.us"
+    )
+    # Authenticated API + market WebSocket. API credentials are required for WS.
+    polymarket_us_api_url: str = os.getenv(
+        "POLYMARKET_US_API_URL", "https://api.polymarket.us"
+    )
+    polymarket_us_ws_url: str = os.getenv(
+        "POLYMARKET_US_WS_URL", "wss://api.polymarket.us/v1/ws/markets"
+    )
+    polymarket_us_key_id: str | None = os.getenv("POLYMARKET_KEY_ID") or None
+    polymarket_us_secret_key: str | None = os.getenv("POLYMARKET_SECRET_KEY") or None
+    polymarket_us_taker_fee_coefficient: float = _float(
+        "POLYMARKET_US_TAKER_FEE_COEFFICIENT", 0.06
+    )
+
+    # Keep the international endpoints available for old notebooks/manual research,
+    # but the active PolymarketClient now uses Polymarket US.
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
     polymarket_clob_url: str = "https://clob.polymarket.com"
-    polymarket_ws_url: str = os.getenv(
-        "POLYMARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    )
+    polymarket_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     kalshi_fee_bps: float = _float("KALSHI_FEE_BPS", 0.0)
     polymarket_fee_bps: float = _float("POLYMARKET_FEE_BPS", 0.0)
