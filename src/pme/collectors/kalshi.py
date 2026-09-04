@@ -50,7 +50,11 @@ class KalshiClient(MarketDataClient):
         cursor: str | None = None
         while len(results) < limit:
             page_size = min(1000, limit - len(results))
-            params: dict[str, Any] = {"limit": page_size, "status": "open"}
+            params: dict[str, Any] = {
+                "limit": page_size,
+                "status": "open",
+                "mve_filter": "exclude",
+            }
             if cursor:
                 params["cursor"] = cursor
             response = await self.client.get(f"{self.base_url}/markets", params=params)

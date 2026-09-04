@@ -16,9 +16,16 @@ from pme.collectors import KalshiClient, OddsApiClient, PolymarketClient
 from pme.collectors.websockets import stream_kalshi, stream_polymarket
 from pme.config import settings
 from pme.database import Database
+from pme.matching.auto import auto_match_markets
 from pme.matching.mappings import load_mapping_csv
 from pme.matching.matcher import suggest_matches
-from pme.models import ConstraintKind, ProbabilityConstraint, Venue
+from pme.matching.normalize import canonical_slug
+from pme.models import (
+    ConstraintKind,
+    MarketMapping,
+    ProbabilityConstraint,
+    Venue,
+)
 from pme.research.price_discovery import convergence_episodes, lead_lag_correlation
 from pme.signals.constraints import evaluate_constraints, repair_prices
 from pme.signals.cross_market import CostModel, detect_cross_venue
@@ -67,6 +74,40 @@ def discover(
         table.add_row(m.venue.value, m.market_id, (m.token_id or "")[:18], m.question[:80])
     console.print(table)
     console.print(f"Stored {len(markets)} markets")
+
+@app.command("discover-polymarket-sports")
+def discover_polymarket_sports(
+    limit: int = typer.Option(2000, min=1, max=5000),
+) -> None:
+    async def run():
+        async with PolymarketClient() as client:
+            return await client.list_sports_markets(limit)
+
+    markets = asyncio.run(run())
+
+    db = _db()
+    db.upsert_markets(markets)
+    db.close()
+
+    table = Table(
+        "Market ID",
+        "Type",
+        "Game ID",
+        "Question",
+    )
+
+    for market in markets[:30]:
+        metadata = market.metadata
+
+        table.add_row(
+            market.market_id,
+            str(metadata.get("sportsMarketType") or ""),
+            str(metadata.get("gameId") or ""),
+            market.question[:80],
+        )
+
+    console.print(table)
+    console.print(f"Stored {len(markets)} Polymarket sports markets")
 
 
 @app.command("suggest-matches")
@@ -135,6 +176,301 @@ def import_mappings(path: Path) -> None:
     db.close()
     console.print(f"Imported {count} mappings")
 
+@app.command("auto-map")
+def auto_map(
+    min_score: float = typer.Option(
+        93.0,
+        help="Minimum overall match score.",
+    ),
+    min_text_score: float = typer.Option(
+        90.0,
+        help="Minimum fuzzy text similarity.",
+    ),
+    min_date_score: float = typer.Option(
+        80.0,
+        help="Minimum date similarity score.",
+    ),
+    min_margin: float = typer.Option(
+        5.0,
+        help="Required lead over the second-best candidate.",
+    ),
+    max_spread: float = typer.Option(
+        0.15,
+        help="Maximum allowed bid/ask spread on either venue.",
+    ),
+    min_size: float = typer.Option(
+        1.0,
+        help="Minimum known top-of-book size.",
+    ),
+    refresh: bool = typer.Option(
+        True,
+        "--refresh/--no-refresh",
+        help="Fetch fresh markets from both exchanges first.",
+    ),
+    kalshi_limit: int = typer.Option(
+        2000,
+        min=1,
+        max=5000,
+    ),
+    polymarket_limit: int = typer.Option(
+        2000,
+        min=1,
+        max=2000,
+        help=(
+            "Keep at 2000 or below until "
+            "Polymarket pagination is upgraded."
+        ),
+    ),
+) -> None:
+    """
+    Automatically discover, filter, quality-check,
+    and store high-confidence cross-venue mappings.
+    """
+
+    db = _db()
+
+    if refresh:
+
+        async def discover_both():
+            async with (
+                KalshiClient() as kalshi,
+                PolymarketClient() as poly,
+            ):
+                return await asyncio.gather(
+                    kalshi.list_markets(kalshi_limit),
+                    poly.list_markets(polymarket_limit),
+                )
+
+        console.print(
+            "[bold]Discovering fresh markets...[/bold]"
+        )
+
+        kalshi_markets, poly_markets = asyncio.run(
+            discover_both()
+        )
+
+        db.upsert_markets(
+            kalshi_markets + poly_markets
+        )
+
+        console.print(
+            f"Discovered {len(kalshi_markets)} Kalshi "
+            f"and {len(poly_markets)} Polymarket markets"
+        )
+
+    markets = db.markets()
+
+    suggestions = auto_match_markets(
+        markets,
+        min_score=min_score,
+        min_text_score=min_text_score,
+        min_date_score=min_date_score,
+        min_margin=min_margin,
+    )
+
+    market_lookup = {
+        (market.venue, market.market_id): market
+        for market in markets
+    }
+
+    async def quality_check():
+        accepted = []
+
+        async with (
+            KalshiClient() as kalshi,
+            PolymarketClient() as poly,
+        ):
+            semaphore = asyncio.Semaphore(12)
+
+            async def check_one(suggestion):
+                async with semaphore:
+                    k_market = market_lookup.get(
+                        (
+                            Venue.KALSHI,
+                            suggestion.kalshi_market_id,
+                        )
+                    )
+
+                    p_market = market_lookup.get(
+                        (
+                            Venue.POLYMARKET,
+                            suggestion.polymarket_market_id,
+                        )
+                    )
+
+                    if k_market is None or p_market is None:
+                        return None
+
+                    if not p_market.token_id:
+                        return None
+
+                    try:
+                        k_quote, p_quote = await asyncio.gather(
+                            kalshi.get_quote(
+                                k_market.market_id
+                            ),
+                            poly.get_quote(
+                                p_market.market_id,
+                                p_market.token_id,
+                            ),
+                        )
+                    except Exception as exc:
+                        console.print(
+                            "[yellow]"
+                            "quality check warning"
+                            "[/yellow] "
+                            f"{k_market.market_id}: {exc}"
+                        )
+                        return None
+
+                    if (
+                        k_quote.bid is None
+                        or k_quote.ask is None
+                        or p_quote.bid is None
+                        or p_quote.ask is None
+                    ):
+                        return None
+
+                    k_spread = (
+                        k_quote.ask - k_quote.bid
+                    )
+
+                    p_spread = (
+                        p_quote.ask - p_quote.bid
+                    )
+
+                    if (
+                        k_spread > max_spread
+                        or p_spread > max_spread
+                    ):
+                        return None
+
+                    known_sizes = [
+                        size
+                        for size in (
+                            k_quote.bid_size,
+                            k_quote.ask_size,
+                            p_quote.bid_size,
+                            p_quote.ask_size,
+                        )
+                        if size is not None
+                    ]
+
+                    if (
+                        known_sizes
+                        and min(known_sizes) < min_size
+                    ):
+                        return None
+
+                    return (
+                        suggestion,
+                        k_market,
+                        p_market,
+                        k_quote,
+                        p_quote,
+                    )
+
+            results = await asyncio.gather(
+                *(
+                    check_one(suggestion)
+                    for suggestion in suggestions
+                )
+            )
+
+            accepted.extend(
+                result
+                for result in results
+                if result is not None
+            )
+
+        return accepted
+
+    console.print(
+        f"High-confidence semantic candidates: "
+        f"{len(suggestions)}"
+    )
+
+    accepted = asyncio.run(quality_check())
+
+    mappings = []
+    quotes = []
+
+    table = Table(
+        "Score",
+        "Event",
+        "Kalshi",
+        "Polymarket",
+        "K spread",
+        "P spread",
+    )
+
+    for (
+        suggestion,
+        k_market,
+        p_market,
+        k_quote,
+        p_quote,
+    ) in accepted:
+
+        event_id = (
+            "auto_"
+            + canonical_slug(k_market.market_id)
+        )
+
+        confidence = suggestion.score / 100.0
+
+        mappings.extend(
+            [
+                MarketMapping(
+                    canonical_event_id=event_id,
+                    canonical_outcome="YES",
+                    venue=Venue.KALSHI,
+                    market_id=k_market.market_id,
+                    question=k_market.question,
+                    confidence=confidence,
+                    verified=True,
+                ),
+                MarketMapping(
+                    canonical_event_id=event_id,
+                    canonical_outcome="YES",
+                    venue=Venue.POLYMARKET,
+                    market_id=p_market.market_id,
+                    token_id=p_market.token_id,
+                    question=p_market.question,
+                    confidence=confidence,
+                    verified=True,
+                ),
+            ]
+        )
+
+        quotes.extend(
+            [
+                k_quote,
+                p_quote,
+            ]
+        )
+
+        table.add_row(
+            f"{suggestion.score:.1f}",
+            event_id,
+            k_market.question[:40],
+            p_market.question[:40],
+            f"{k_quote.spread:.3f}",
+            f"{p_quote.spread:.3f}",
+        )
+
+    db.upsert_mappings(mappings)
+    db.insert_quotes(quotes)
+
+    console.print(table)
+
+    console.print(
+        f"[bold green]"
+        f"Stored {len(accepted)} verified market pairs"
+        f"[/bold green]"
+    )
+
+    db.close()
 
 async def _snapshot_once() -> int:
     db = _db()
@@ -398,6 +734,284 @@ def stream_kalshi_cmd(seconds: int = typer.Option(120, min=1)) -> None:
     finally:
         db.close()
 
+@app.command("live-scan")
+def live_scan(
+    min_edge: float = typer.Option(
+        0.001,
+        help="Minimum net edge per contract. 0.001 = 0.1 cent.",
+    ),
+    seconds: int = typer.Option(
+        0,
+        min=0,
+        help="How long to run. 0 = run until Ctrl+C.",
+    ),
+) -> None:
+    """
+    Stream Kalshi and Polymarket simultaneously and scan for
+    cross-venue arbitrage on every incoming quote update.
+    """
+
+    asyncio.run(_snapshot_once())
+
+    db = _db()
+    mappings = db.mappings(True)
+
+    kalshi_tickers = [
+        m.market_id
+        for m in mappings
+        if m.venue == Venue.KALSHI
+    ]
+
+    polymarket_token_to_market = {
+        m.token_id: m.market_id
+        for m in mappings
+        if m.venue == Venue.POLYMARKET and m.token_id
+    }
+
+    latest = {
+        (q.venue, q.market_id): q
+        for q in db.latest_quotes()
+    }
+
+    mapping_by_market = {
+        (m.venue, m.market_id): m
+        for m in mappings
+    }
+
+    cost_model = CostModel(
+        fee_bps={
+            Venue.KALSHI: settings.kalshi_fee_bps,
+            Venue.POLYMARKET: settings.polymarket_fee_bps,
+        },
+        slippage_bps=settings.slippage_bps,
+    )
+
+    active: set[tuple] = set()
+
+    async def handler(q):
+        latest[(q.venue, q.market_id)] = q
+        db.insert_quotes([q])
+
+        mapping = mapping_by_market.get(
+            (q.venue, q.market_id)
+        )
+
+        if mapping is None:
+            return
+
+    
+        event_quotes = []
+
+        for m in mappings:
+            if (
+                m.canonical_event_id
+                == mapping.canonical_event_id
+                and m.canonical_outcome
+                == mapping.canonical_outcome
+            ):
+                quote = latest.get(
+                    (m.venue, m.market_id)
+                )
+
+                if quote is not None:
+                    event_quotes.append(quote)
+
+        if len(event_quotes) >= 2:
+            kalshi_quote = next(
+                (
+                    x
+                    for x in event_quotes
+                    if x.venue == Venue.KALSHI
+                ),
+                None,
+            )
+
+            poly_quote = next(
+                (
+                    x
+                    for x in event_quotes
+                    if x.venue == Venue.POLYMARKET
+                ),
+                None,
+            )
+
+            if kalshi_quote and poly_quote:
+                k_bid = kalshi_quote.bid
+                k_ask = kalshi_quote.ask
+                p_bid = poly_quote.bid
+                p_ask = poly_quote.ask
+
+                if None not in (
+                    k_bid,
+                    k_ask,
+                    p_bid,
+                    p_ask,
+                ):
+                    buy_kalshi_edge = (
+                        p_bid - k_ask
+                    )
+
+                    buy_poly_edge = (
+                        k_bid - p_ask
+                    )
+
+                    console.print(
+                        f"{mapping.canonical_event_id} | "
+                        f"K {k_bid:.3f}/{k_ask:.3f} | "
+                        f"P {p_bid:.3f}/{p_ask:.3f} | "
+                        f"K→P "
+                        f"{100 * buy_kalshi_edge:+.2f}% | "
+                        f"P→K "
+                        f"{100 * buy_poly_edge:+.2f}%"
+                    )
+
+        opportunities = detect_cross_venue(
+            list(latest.values()),
+            mappings,
+            cost_model=cost_model,
+            min_net_edge=min_edge,
+            max_pair_skew_seconds=None,
+            max_quote_age_seconds=None,
+        )
+
+        opportunities = [
+            o
+            for o in opportunities
+            if (
+                o.canonical_event_id
+                == mapping.canonical_event_id
+                and o.canonical_outcome
+                == mapping.canonical_outcome
+            )
+        ]
+
+        current = {}
+
+        for opportunity in opportunities:
+            key = (
+                opportunity.canonical_event_id,
+                opportunity.canonical_outcome,
+                opportunity.buy_venue,
+                opportunity.hedge_venue,
+            )
+
+            current[key] = opportunity
+
+            db.insert_opportunities([opportunity])
+
+        event_active = {
+            key
+            for key in active
+            if (
+                key[0] == mapping.canonical_event_id
+                and key[1]
+                == mapping.canonical_outcome
+            )
+        }
+
+        current_keys = set(current)
+
+        for key in current_keys - event_active:
+            opportunity = current[key]
+
+            size = (
+                "?"
+                if opportunity.available_size is None
+                else f"{opportunity.available_size:.1f}"
+            )
+
+            console.print()
+            console.print(
+                "[bold green]"
+                "⚡ ARBITRAGE OPEN"
+                "[/bold green]"
+            )
+
+            console.print(
+                "Event: "
+                f"{opportunity.canonical_event_id}"
+            )
+
+            console.print(
+                "Buy YES: "
+                f"{opportunity.buy_venue.value} "
+                f"@ {opportunity.buy_price:.4f}"
+            )
+
+            console.print(
+                "Hedge: "
+                f"{opportunity.hedge_venue.value}"
+            )
+
+            console.print(
+                "Gross edge: "
+                f"{100 * opportunity.gross_edge:.3f}%"
+            )
+
+            console.print(
+                "Net edge:   "
+                f"{100 * opportunity.net_edge:.3f}%"
+            )
+
+            console.print(
+                f"Available size: {size}"
+            )
+
+            console.print()
+
+        for key in event_active - current_keys:
+            console.print(
+                "[red]✕ ARBITRAGE CLOSED[/red] "
+                f"{key[0]}"
+            )
+
+        active.difference_update(event_active)
+        active.update(current_keys)
+
+    async def run():
+        console.print(
+            "[bold]"
+            "Starting live arbitrage scanner..."
+            "[/bold]"
+        )
+
+        console.print(
+            f"Kalshi markets: {len(kalshi_tickers)}"
+        )
+
+        console.print(
+            "Polymarket markets: "
+            f"{len(polymarket_token_to_market)}"
+        )
+
+        console.print(
+            "Minimum net edge: "
+            f"{100 * min_edge:.3f}%"
+        )
+
+        duration = (
+            None
+            if seconds == 0
+            else seconds
+        )
+
+        await asyncio.gather(
+            stream_kalshi(
+                kalshi_tickers,
+                handler,
+                seconds=duration,
+            ),
+            stream_polymarket(
+                polymarket_token_to_market,
+                handler,
+                seconds=duration,
+            ),
+        )
+
+    try:
+        asyncio.run(run())
+    finally:
+        db.close()
 
 def _aligned_mid_series(rows: list[tuple]) -> tuple[list[float], list[float]]:
     # Simple snapshot-index alignment: suitable for regular REST polling. For irregular WS data,

@@ -92,6 +92,121 @@ class PolymarketClient(MarketDataClient):
                 break
         return results[:limit]
 
+    async def list_sports_markets(
+        self,
+        limit: int = 1000,
+    ) -> list[Market]:
+        results: list[Market] = []
+        seen_ids: set[str] = set()
+        offset = 0
+        page_size = 100
+
+        while len(results) < limit:
+            params = {
+                "limit": page_size,
+                "offset": offset,
+                "active": "true",
+                "closed": "false",
+                "tag_slug": "sports",
+                "order": "id",
+                "ascending": "false",
+            }
+
+            response = await self.client.get(
+                f"{self.gamma_url}/events",
+                params=params,
+            )
+            response.raise_for_status()
+
+            events = response.json()
+
+            if not isinstance(events, list) or not events:
+                break
+
+            for event in events:
+                event_markets = event.get("markets") or []
+
+                if not isinstance(event_markets, list):
+                    continue
+
+                for row in event_markets:
+                    if not isinstance(row, dict):
+                        continue
+
+                    if row.get("closed"):
+                        continue
+
+                    if not row.get("active", True):
+                        continue
+
+                    # Keep actual sports markets rather than futures that
+                    # merely happen to mention an athlete/team.
+                    if not any(
+                        (
+                            row.get("sportsMarketType"),
+                            row.get("gameId"),
+                            row.get("eventStartTime"),
+                            row.get("gameStartTime"),
+                        )
+                    ):
+                        continue
+
+                    market_id = str(row.get("id") or "")
+
+                    if not market_id or market_id in seen_ids:
+                        continue
+
+                    enriched = dict(row)
+
+                    # Preserve event-level context for matching.
+                    enriched["events"] = [
+                        {
+                            "id": event.get("id"),
+                            "ticker": event.get("ticker"),
+                            "slug": event.get("slug"),
+                            "title": event.get("title"),
+                            "subtitle": event.get("subtitle"),
+                            "description": event.get("description"),
+                            "startDate": event.get("startDate"),
+                            "endDate": event.get("endDate"),
+                            "category": event.get("category"),
+                        }
+                    ]
+
+                    if not enriched.get("category"):
+                        enriched["category"] = event.get("category") or "sports"
+
+                    if not enriched.get("startDate"):
+                        enriched["startDate"] = (
+                            row.get("eventStartTime")
+                            or row.get("gameStartTime")
+                            or event.get("startDate")
+                        )
+
+                    if not enriched.get("endDate"):
+                        enriched["endDate"] = event.get("endDate")
+
+                    market = self._normalize_market(enriched)
+
+                    if market is None:
+                        continue
+
+                    seen_ids.add(market_id)
+                    results.append(market)
+
+                    if len(results) >= limit:
+                        break
+
+                if len(results) >= limit:
+                    break
+
+            offset += len(events)
+
+            if len(events) < page_size:
+                break
+
+        return results[:limit]
+
     def _normalize_market(self, row: dict[str, Any]) -> Market | None:
         outcomes = [str(x) for x in _parse_jsonish(row.get("outcomes"))]
         token_ids = [str(x) for x in _parse_jsonish(row.get("clobTokenIds"))]
