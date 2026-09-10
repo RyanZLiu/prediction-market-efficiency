@@ -19,7 +19,6 @@ from pme.executable import (
     kalshi_taker_fee,
     market_pair,
     polymarket_taker_fee,
-    quote_gate,
 )
 from pme.matching.auto import auto_match_markets
 from pme.matching.normalize import canonical_slug
@@ -104,6 +103,11 @@ class LiveArbitrageTracker:
     def status(self) -> dict[str, Any]:
         with self._status_lock:
             return asdict(self._status)
+
+    def current_event_ids(self) -> set[str]:
+        # Canonical event IDs in the tracker's current live subscription set.
+        mappings = tuple(self._mappings)
+        return {mapping.canonical_event_id for mapping in mappings}
 
     def _set_status(self, **values: Any) -> None:
         with self._status_lock:
@@ -359,16 +363,9 @@ class LiveArbitrageTracker:
             await self._close_event_alerts(db, event_key)
             return
 
-        gate = quote_gate(
-            k_quote,
-            p_quote,
-            max_age_seconds=self.config.max_quote_age_seconds,
-            max_skew_seconds=self.config.max_pair_skew_seconds,
-        )
-        if not gate.passed:
-            await self._close_event_alerts(db, event_key)
-            return
-
+        # WebSocket timestamps are last-change times. Quiet markets can have
+        # old timestamps while their current books remain valid. Cached quotes
+        # only identify candidate directions; fresh books are checked below.
         if not self._rules_verified(db, k_mapping.market_id, p_mapping.market_id):
             await self._close_event_alerts(db, event_key)
             return
@@ -432,14 +429,8 @@ class LiveArbitrageTracker:
             return None
         k_mapping, p_mapping, k_market, p_market = pair
 
-        gate = quote_gate(
-            k_quote,
-            p_quote,
-            max_age_seconds=self.config.max_quote_age_seconds,
-            max_skew_seconds=self.config.max_pair_skew_seconds,
-        )
-        if not gate.passed:
-            return None
+        # k_quote / p_quote are event-driven candidate signals. Actual
+        # freshness is established by the executable-book snapshots below.
         if not self._rules_verified(db, k_mapping.market_id, p_mapping.market_id):
             return None
 
@@ -467,8 +458,25 @@ class LiveArbitrageTracker:
         p_book_ts = p_book.get("timestamp")
         if not isinstance(k_book_ts, datetime) or not isinstance(p_book_ts, datetime):
             return None
+
+        if k_book_ts.tzinfo is None:
+            k_book_ts = k_book_ts.replace(tzinfo=UTC)
+        else:
+            k_book_ts = k_book_ts.astimezone(UTC)
+        if p_book_ts.tzinfo is None:
+            p_book_ts = p_book_ts.replace(tzinfo=UTC)
+        else:
+            p_book_ts = p_book_ts.astimezone(UTC)
+
+        verified_at = datetime.now(UTC)
+        k_book_age = max(0.0, (verified_at - k_book_ts).total_seconds())
+        p_book_age = max(0.0, (verified_at - p_book_ts).total_seconds())
         book_skew = abs((k_book_ts - p_book_ts).total_seconds())
-        if book_skew > self.config.max_pair_skew_seconds:
+        if (
+            k_book_age > self.config.max_quote_age_seconds
+            or p_book_age > self.config.max_quote_age_seconds
+            or book_skew > self.config.max_pair_skew_seconds
+        ):
             return None
 
         if direction == "K→P":
@@ -592,9 +600,9 @@ class LiveArbitrageTracker:
             total_cost=total_cost,
             payout=payout,
             net_roi=net_roi,
-            kalshi_quote_age_seconds=gate.kalshi_age_seconds,
-            polymarket_quote_age_seconds=gate.polymarket_age_seconds,
-            quote_skew_seconds=gate.skew_seconds,
+            kalshi_quote_age_seconds=k_book_age,
+            polymarket_quote_age_seconds=p_book_age,
+            quote_skew_seconds=book_skew,
             verification_latency_seconds=latency,
             match_confidence=confidence,
             rules_verified=True,
@@ -630,6 +638,13 @@ class LiveArbitrageTracker:
             await asyncio.sleep(0.5)
 
     async def _expire_stale_alerts(self, db: Database) -> None:
+        """Keep alerts open only while fresh executable books reconfirm them."""
+        now = datetime.now(UTC)
+        reverify_after = min(
+            1.5,
+            max(0.75, self.config.max_quote_age_seconds * 0.75),
+        )
+
         for key, opportunity in list(self._active.items()):
             mappings = self._event_mappings.get(key[:2], [])
             pair = market_pair(mappings, self._market_by_key)
@@ -638,23 +653,38 @@ class LiveArbitrageTracker:
                 self._delete_live(db, key)
                 self._insert_alert(db, "closed", opportunity)
                 continue
+
             k_mapping, p_mapping, _k_market, _p_market = pair
-            k_quote = self._latest.get((Venue.KALSHI, k_mapping.market_id))
-            p_quote = self._latest.get((Venue.POLYMARKET, p_mapping.market_id))
-            rules_ok = self._rules_verified(db, k_mapping.market_id, p_mapping.market_id)
-            if k_quote is None or p_quote is None or not rules_ok:
-                passed = False
-            else:
-                passed = quote_gate(
-                    k_quote,
-                    p_quote,
-                    max_age_seconds=self.config.max_quote_age_seconds,
-                    max_skew_seconds=self.config.max_pair_skew_seconds,
-                ).passed
-            if not passed:
+            if not self._rules_verified(db, k_mapping.market_id, p_mapping.market_id):
                 self._active.pop(key, None)
                 self._delete_live(db, key)
                 self._insert_alert(db, "closed", opportunity)
+                continue
+
+            k_quote = self._latest.get((Venue.KALSHI, k_mapping.market_id))
+            p_quote = self._latest.get((Venue.POLYMARKET, p_mapping.market_id))
+            if k_quote is None or p_quote is None:
+                self._active.pop(key, None)
+                self._delete_live(db, key)
+                self._insert_alert(db, "closed", opportunity)
+                continue
+
+            age = max(0.0, (now - opportunity.timestamp).total_seconds())
+            if age < reverify_after:
+                continue
+
+            refreshed = await self._verify_direction(
+                db, mappings, k_quote, p_quote, key[2]
+            )
+            if refreshed is None:
+                self._active.pop(key, None)
+                self._delete_live(db, key)
+                self._insert_alert(db, "closed", opportunity)
+                continue
+
+            self._active[key] = refreshed
+            self._upsert_live(db, refreshed)
+
         self._set_status(active_alerts=len(self._active))
 
     async def _close_event_alerts(self, db: Database, event_key: tuple[str, str]) -> None:

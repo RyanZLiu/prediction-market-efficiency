@@ -16,12 +16,12 @@ from pme.database import Database
 from pme.live import LiveArbitrageTracker
 
 st.set_page_config(
-    page_title="Live Prediction-Market Arbitrage",
+    page_title="Kalshi ↔ Polymarket US Arbitrage",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ Live Kalshi ↔ Polymarket US US Arbitrage")
+st.title("⚡ Live Kalshi ↔ Polymarket US Arbitrage")
 st.caption(
     "Automatic shared-market discovery with executable-book verification. "
     "Green alerts require fresh synchronized quotes, actual YES/NO books, "
@@ -57,9 +57,9 @@ with st.sidebar:
     st.divider()
     st.write("**Executable alert threshold**")
     st.code(f"{100 * tracker.config.min_net_edge:.3f}% net edge / contract")
-    st.write("**Quote freshness**")
+    st.write("**Verified-book freshness**")
     st.code(f"≤ {tracker.config.max_quote_age_seconds:.1f} sec each")
-    st.write("**Max quote skew**")
+    st.write("**Verified-book max skew**")
     st.code(f"≤ {tracker.config.max_pair_skew_seconds:.1f} sec")
     st.write("**Book verification latency**")
     st.code(f"≤ {tracker.config.max_verification_latency_seconds:.1f} sec")
@@ -104,6 +104,7 @@ def _age_seconds(timestamp: datetime | None) -> float | None:
 @st.fragment(run_every="1s")
 def live_panel() -> None:
     status = tracker.status()
+    current_event_ids = tracker.current_event_ids()
 
     db = _open_db()
     try:
@@ -172,6 +173,15 @@ def live_panel() -> None:
     finally:
         db.close()
 
+    # The mappings table is persistent, so it can contain pairs from older runs.
+    # The main board should show only the pairs this tracker is subscribed to now.
+    if board.empty:
+        historical_board = board.copy()
+    else:
+        current_mask = board["canonical_event_id"].isin(current_event_ids)
+        historical_board = board.loc[~current_mask].copy()
+        board = board.loc[current_mask].copy()
+
     running = bool(status["running"])
     last_error = status["last_error"]
     mode = str(status["mode"])
@@ -197,11 +207,11 @@ def live_panel() -> None:
     c2.metric("Shared pairs", f"{status['mapped_pairs']:,}")
     c3.metric("Executable arbs", f"{len(active):,}")
     c4.metric("Alert transitions", f"{alert_count:,}")
-    c5.metric("Last quote", _format_age(status["last_quote"]))
+    c5.metric("Last feed update", _format_age(status["last_quote"]))
 
     st.caption(
         f"Status: {phase} · discovered {status['kalshi_markets']:,} Kalshi + "
-        f"{status['polymarket_markets']:,} Polymarket markets · map refreshed "
+        f"{status['polymarket_markets']:,} Polymarket US markets · map refreshed "
         f"{_format_age(status['last_market_refresh'])}"
     )
     if last_error:
@@ -243,30 +253,105 @@ def live_panel() -> None:
                 f"Checks: ✅ actual YES/NO books · ✅ rules reviewed · ✅ venue fees · ✅ size both legs"
             )
 
-    st.subheader("Live K / P market board")
+    st.subheader("Live Kalshi / Polymarket US market board")
     st.caption(
-        "K→P/P→K below are *indicative gross price gaps* from the live YES quotes. "
-        "They are not actionable alerts. The tracker re-fetches the actual YES and NO "
-        "books and fee parameters before creating a green alert."
+        "K→P/P→K are indicative gaps from the latest WebSocket market-data changes. "
+        "The age columns mean *time since that venue last changed*, not stale-book age. "
+        "A quiet market may show a large change age while the connection is healthy. "
+        "Before a green alert, the tracker independently re-fetches both executable books "
+        f"and requires those snapshots to be ≤ {tracker.config.max_quote_age_seconds:.1f}s "
+        f"old and ≤ {tracker.config.max_pair_skew_seconds:.1f}s apart."
     )
+
+    st.caption(
+        f"Showing {len(board):,} pair(s) in the current tracker subscription set. "
+        f"{len(historical_board):,} older stored pair(s) are hidden from the live board."
+    )
+
+    def render_historical_pairs() -> None:
+        if historical_board.empty:
+            return
+
+        with st.expander(
+            f"Historical / stale stored pairs ({len(historical_board):,})",
+            expanded=False,
+        ):
+            st.caption(
+                "These mappings or quotes were stored by earlier tracker runs. "
+                "They are excluded from the live board and cannot be mistaken for "
+                "the current subscription set."
+            )
+
+            historical_display = historical_board.copy()
+            historical_display["Event"] = historical_display["question"].fillna(
+                historical_display["canonical_event_id"]
+            )
+            historical_display["K"] = historical_display.apply(
+                lambda row: (
+                    "—"
+                    if row.k_bid is None or row.k_ask is None
+                    else f"{row.k_bid:.3f} / {row.k_ask:.3f}"
+                ),
+                axis=1,
+            )
+            historical_display["P"] = historical_display.apply(
+                lambda row: (
+                    "—"
+                    if row.p_bid is None or row.p_ask is None
+                    else f"{row.p_bid:.3f} / {row.p_ask:.3f}"
+                ),
+                axis=1,
+            )
+            historical_display["Match"] = 100 * historical_display["confidence"]
+            historical_display["Rules"] = historical_display["rules_verified"].map(
+                {True: "✅ VERIFIED", False: "⚠️ REVIEW"}
+            )
+
+            st.dataframe(
+                historical_display[
+                    [
+                        "Event",
+                        "K",
+                        "P",
+                        "k_timestamp",
+                        "p_timestamp",
+                        "Rules",
+                        "Match",
+                    ]
+                ].rename(
+                    columns={
+                        "k_timestamp": "Last K quote",
+                        "p_timestamp": "Last P quote",
+                    }
+                ),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Match": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
 
     required = {"k_bid", "k_ask", "p_bid", "p_ask"}
     if board.empty or not required.issubset(board.columns):
-        st.info("Waiting for current bid/ask data from both venues.")
+        st.info("Waiting for current bid/ask data from the current live pairs.")
+        render_historical_pairs()
         return
 
     board = board.dropna(subset=["k_bid", "k_ask", "p_bid", "p_ask"]).copy()
     if board.empty:
-        st.info("Waiting for current bid/ask data from both venues.")
+        st.info("Waiting for current bid/ask data from the current live pairs.")
+        render_historical_pairs()
         return
 
     now = datetime.now(UTC)
 
-    def gate_label(row: object) -> str:
+    def feed_metrics(
+        row: object,
+    ) -> tuple[float | None, float | None, float | None, str]:
         k_ts = row.k_timestamp
         p_ts = row.p_timestamp
         if k_ts is None or p_ts is None:
-            return "NO QUOTE"
+            return None, None, None, "⚪ NO DATA"
         if k_ts.tzinfo is None:
             k_ts = k_ts.replace(tzinfo=UTC)
         if p_ts.tzinfo is None:
@@ -274,18 +359,48 @@ def live_panel() -> None:
         k_age = max(0.0, (now - k_ts).total_seconds())
         p_age = max(0.0, (now - p_ts).total_seconds())
         skew = abs((k_ts - p_ts).total_seconds())
-        if (
-            k_age <= tracker.config.max_quote_age_seconds
-            and p_age <= tracker.config.max_quote_age_seconds
-            and skew <= tracker.config.max_pair_skew_seconds
-        ):
-            return "FRESH"
-        return "STALE"
+
+        recent_k = k_age <= tracker.config.max_quote_age_seconds
+        recent_p = p_age <= tracker.config.max_quote_age_seconds
+        if recent_k and recent_p and skew <= tracker.config.max_pair_skew_seconds:
+            label = "🟢 RECENT CHANGES"
+        elif not recent_k and not recent_p:
+            label = "⚪ QUIET"
+        elif recent_k:
+            label = "🟡 K CHANGED"
+        else:
+            label = "🟡 P CHANGED"
+        return k_age, p_age, skew, label
 
     board["k_to_p_gross"] = board["p_bid"] - board["k_ask"]
     board["p_to_k_gross"] = board["k_bid"] - board["p_ask"]
     board["best_gap"] = board[["k_to_p_gross", "p_to_k_gross"]].max(axis=1)
     board = board.sort_values("best_gap", ascending=False)
+
+    metrics = [
+        feed_metrics(row)
+        for row in board.itertuples(index=False)
+    ]
+
+    board["k_age_s"] = [
+        metric[0]
+        for metric in metrics
+    ]
+
+    board["p_age_s"] = [
+        metric[1]
+        for metric in metrics
+    ]
+
+    board["quote_skew_s"] = [
+        metric[2]
+        for metric in metrics
+    ]
+
+    board["feed_activity"] = [
+        metric[3]
+        for metric in metrics
+    ]
 
     display = board.copy()
     display["Event"] = display["question"].fillna(display["canonical_event_id"])
@@ -293,18 +408,73 @@ def live_panel() -> None:
     display["P"] = display.apply(lambda r: f"{r.p_bid:.3f} / {r.p_ask:.3f}", axis=1)
     display["K→P gross"] = 100 * display["k_to_p_gross"]
     display["P→K gross"] = 100 * display["p_to_k_gross"]
-    display["Freshness"] = [gate_label(r) for r in board.itertuples(index=False)]
-    display["Rules"] = display["rules_verified"].map({True: "✅ VERIFIED", False: "⚠️ REVIEW"})
+    display["K change age (s)"] = display["k_age_s"]
+    display["P change age (s)"] = display["p_age_s"]
+    display["Change skew (s)"] = display["quote_skew_s"]
+    display["Feed activity"] = display["quote_gate"]
+    display["Rules"] = display["rules_verified"].map(
+        {
+            True: "✅ VERIFIED",
+            False: "⚠️ REVIEW",
+        }
+    )
     display["Match"] = 100 * display["confidence"]
 
     st.dataframe(
-        display[["Event", "K", "P", "K→P gross", "P→K gross", "Freshness", "Rules", "Match"]],
+        display[
+            [
+                "Event",
+                "K",
+                "P",
+                "K→P gross",
+                "P→K gross",
+                "K change age (s)",
+                "P change age (s)",
+                "Change skew (s)",
+                "Feed activity",
+                "Rules",
+                "Match",
+            ]
+        ],
         width="stretch",
         hide_index=True,
         column_config={
-            "K→P gross": st.column_config.NumberColumn(format="%+.3f%%"),
-            "P→K gross": st.column_config.NumberColumn(format="%+.3f%%"),
-            "Match": st.column_config.NumberColumn(format="%.1f%%"),
+            "K→P gross": st.column_config.NumberColumn(
+                format="%+.3f%%"
+            ),
+            "P→K gross": st.column_config.NumberColumn(
+                format="%+.3f%%"
+            ),
+            "K change age (s)": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Seconds since Kalshi last emitted a market-data change. Informational only.",
+            ),
+            "P change age (s)": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Seconds since Polymarket US last emitted a market-data change. Informational only.",
+            ),
+            "Change skew (s)": st.column_config.NumberColumn(
+                format="%.2f",
+                help=(
+                    "Absolute timestamp difference between "
+                    "the Kalshi and Polymarket US quotes."
+                ),
+            ),
+            "Feed activity": st.column_config.TextColumn(
+                help=(
+                    "PASS requires both quote ages and their "
+                    "timestamp skew to satisfy the sidebar limits."
+                ),
+            ),
+            "Rules": st.column_config.TextColumn(
+                help=(
+                    "REVIEW means the settlement rules have "
+                    "not been manually verified yet."
+                ),
+            ),
+            "Match": st.column_config.NumberColumn(
+                format="%.1f%%"
+            ),
         },
     )
 
@@ -326,6 +496,8 @@ def live_panel() -> None:
     fig.add_hline(y=0, line_dash="dash")
     fig.update_layout(xaxis_title=None, legend_title=None)
     st.plotly_chart(fig, width="stretch")
+
+    render_historical_pairs()
 
 
 live_panel()

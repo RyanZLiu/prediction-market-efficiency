@@ -252,12 +252,15 @@ class PolymarketClient(MarketDataClient):
             raise ValueError("Polymarket US market slug is missing")
 
         book = await self.get_orderbook(market.market_id, slug)
+        snapshot_received_at = utcnow()
         yes_bid = book.best_bid
         yes_ask = book.best_ask
         coefficient = _fee_coefficient(market.metadata.get("feeCoefficient"))
 
         return {
-            "timestamp": book.timestamp,
+            # Executable freshness is the time this REST snapshot was received,
+            # not the exchange's last book-change timestamp.
+            "timestamp": snapshot_received_at,
             "market_id": market.market_id,
             "market_slug": slug,
             "yes_bid": None if yes_bid is None else yes_bid.price,
