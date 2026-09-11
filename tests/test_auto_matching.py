@@ -55,3 +55,38 @@ def test_auto_match_ignores_completed_polymarket_market() -> None:
     matches = auto_match_markets(markets, min_score=70.0, min_text_score=70.0)
 
     assert matches == []
+
+
+def test_auto_match_rejects_touchdown_scorer_vs_passing_touchdowns() -> None:
+    kalshi = Market(
+        venue=Venue.KALSHI,
+        market_id="KXNFLTD-26SEP10SFLAR-LARMSTAFFORD9-1",
+        question="Matthew Stafford: 1+ touchdowns",
+        category="sports",
+        metadata={
+            "rules_primary": (
+                "If Matthew Stafford scores at least 1+ touchdowns in the "
+                "San Francisco vs Los Angeles R Pro Football game, then the market resolves to Yes."
+            )
+        },
+    )
+    poly = Market(
+        venue=Venue.POLYMARKET,
+        market_id="567750",
+        token_id="astatc-nfl-sf-lar-2026-09-10-ptd-matsta-gte1",
+        question="Will Matthew Stafford record 1+ passing touchdowns?",
+        category="sports",
+        metadata={
+            "sportsMarketType": "football_player_passing_touchdowns",
+            "description": "This market settles Yes if Stafford records 1+ passing touchdowns.",
+        },
+    )
+
+    matches = auto_match_markets(
+        [kalshi, poly],
+        min_score=80.0,
+        min_text_score=80.0,
+        min_margin=1.0,
+    )
+
+    assert matches == []

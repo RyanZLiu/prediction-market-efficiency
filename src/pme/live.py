@@ -51,6 +51,8 @@ class LiveTrackerStatus:
     last_error: str | None = None
     last_market_refresh: datetime | None = None
     last_quote: datetime | None = None
+    last_kalshi_quote: datetime | None = None
+    last_polymarket_quote: datetime | None = None
     kalshi_markets: int = 0
     polymarket_markets: int = 0
     mapped_pairs: int = 0
@@ -224,11 +226,34 @@ class LiveArbitrageTracker:
                 )
             db.replace_auto_mappings(auto_mappings)
 
-            active_keys = {(m.venue, m.market_id) for m in all_markets if m.active}
+            active_markets = {
+                (m.venue, m.market_id): m
+                for m in all_markets
+                if m.active
+            }
+
+            def mapping_is_current(mapping: MarketMapping) -> bool:
+                current = active_markets.get((mapping.venue, mapping.market_id))
+                if current is None:
+                    return False
+
+                # Old international-Polymarket mappings can share numeric market
+                # IDs with current Polymarket US rows while carrying a legacy
+                # CLOB token id instead of a US market slug. Require the mapping
+                # slug to exactly match the freshly discovered US market slug.
+                if mapping.venue == Venue.POLYMARKET:
+                    return bool(
+                        mapping.token_id
+                        and current.token_id
+                        and mapping.token_id == current.token_id
+                    )
+
+                return True
+
             mappings = [
                 mapping
                 for mapping in db.mappings(verified_only=True)
-                if (mapping.venue, mapping.market_id) in active_keys
+                if mapping_is_current(mapping)
             ]
 
             semaphore = asyncio.Semaphore(20)
@@ -343,7 +368,13 @@ class LiveArbitrageTracker:
         self._latest[(quote.venue, quote.market_id)] = quote
         if persist:
             db.insert_quotes([quote])
-        self._set_status(last_quote=quote.timestamp)
+
+        status_update: dict[str, Any] = {"last_quote": quote.timestamp}
+        if quote.venue == Venue.KALSHI:
+            status_update["last_kalshi_quote"] = quote.timestamp
+        elif quote.venue == Venue.POLYMARKET:
+            status_update["last_polymarket_quote"] = quote.timestamp
+        self._set_status(**status_update)
 
         mapping = self._mapping_by_market.get((quote.venue, quote.market_id))
         if mapping is None:

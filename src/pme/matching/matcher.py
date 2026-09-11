@@ -134,6 +134,62 @@ def _contract_scope(market: Market) -> str:
     return "unknown"
 
 
+
+def _sports_prop_signature(market: Market) -> str:
+    """Return a conservative sports-prop subtype for match filtering."""
+    metadata = market.metadata
+    parts = [
+        market.question,
+        market.market_id,
+        str(metadata.get("slug") or ""),
+        str(metadata.get("description") or ""),
+        str(metadata.get("rules_primary") or ""),
+        str(metadata.get("rules_secondary") or ""),
+        str(metadata.get("sportsMarketType") or ""),
+        str(metadata.get("sportsMarketTypeV2") or ""),
+    ]
+    text = " ".join(parts).lower()
+
+    if (
+        "football_player_passing_touchdowns" in text
+        or "passing touchdown" in text
+        or re.search(r"(?:^|-)ptd(?:-|$)", text)
+    ):
+        return "football_player_passing_touchdowns"
+
+    if "passing yards" in text or "football_player_passing_yards" in text:
+        return "football_player_passing_yards"
+
+    if "receiving yards" in text or "football_player_receiving_yards" in text:
+        return "football_player_receiving_yards"
+
+    if "rushing yards" in text or "football_player_rushing_yards" in text:
+        return "football_player_rushing_yards"
+
+    if "receptions" in text or "football_player_receptions" in text:
+        return "football_player_receptions"
+
+    if market.market_id.upper().startswith("KXNFLTD"):
+        return "football_player_touchdowns_scored"
+
+    if (
+        "touchdown" in text
+        and "scores at least" in text
+        and "passing touchdown" not in text
+    ):
+        return "football_player_touchdowns_scored"
+
+    return "unknown"
+
+
+def _contracts_compatible(a: Market, b: Market) -> bool:
+    """Reject known contract-subtype conflicts before fuzzy matching."""
+    a_prop = _sports_prop_signature(a)
+    b_prop = _sports_prop_signature(b)
+    if a_prop != "unknown" and b_prop != "unknown" and a_prop != b_prop:
+        return False
+    return True
+
 def _is_compound_kalshi_market(market: Market) -> bool:
     ticker = market.market_id.upper()
 
@@ -271,6 +327,9 @@ def suggest_matches(
                 kalshi_market,
                 poly_market,
             ):
+                continue
+
+            if not _contracts_compatible(kalshi_market, poly_market):
                 continue
 
             score, text, date, category = score_pair(

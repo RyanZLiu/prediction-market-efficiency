@@ -7,6 +7,7 @@ from rapidfuzz.fuzz import token_set_ratio
 from pme.matching.matcher import (
     MatchSuggestion,
     _contract_scope,
+    _contracts_compatible,
     _is_compound_kalshi_market,
     _passes_anchor_filter,
     _tokens,
@@ -14,6 +15,157 @@ from pme.matching.matcher import (
 )
 from pme.matching.normalize import normalize_text
 from pme.models import Market, MarketType, Venue
+
+
+def _semantic_contract_tags(market: Market) -> set[str]:
+    metadata = market.metadata
+
+    parts = [
+        market.question,
+        market.market_id,
+        str(market.token_id or ""),
+        str(metadata.get("slug") or ""),
+        str(metadata.get("description") or ""),
+        str(metadata.get("rules_primary") or ""),
+        str(metadata.get("rules_secondary") or ""),
+        str(metadata.get("sportsMarketType") or ""),
+        str(metadata.get("sportsMarketTypeV2") or ""),
+    ]
+
+    combined = " ".join(parts).lower()
+    tags: set[str] = set()
+
+    # Award contracts
+    if "award" in combined:
+        tags.add("award")
+
+    if "finalist" in combined:
+        tags.add("award_finalist")
+
+    if (
+        "award winner" in combined
+        or ("wins the " in combined and " award" in combined)
+        or ("win the " in combined and " award" in combined)
+    ):
+        tags.add("award_winner")
+
+    # Season/stat-leader contracts
+    stat_patterns = {
+        "most_receiving_yards": (
+            "most receiving yards",
+            "mostrecyds",
+        ),
+        "most_rushing_yards": (
+            "most rushing yards",
+            "mostrushyds",
+        ),
+        "most_passing_yards": (
+            "most passing yards",
+            "mostpassyds",
+        ),
+        "most_receptions": (
+            "most receptions",
+            "mostreceptions",
+        ),
+        "most_passing_touchdowns": (
+            "most passing touchdowns",
+            "mostpassingtd",
+        ),
+    }
+
+    for tag, patterns in stat_patterns.items():
+        if any(pattern in combined for pattern in patterns):
+            tags.add("stat_leader")
+            tags.add(tag)
+
+    # Player stat props
+    if (
+        "passing touchdown" in combined
+        or "football_player_passing_touchdowns" in combined
+    ):
+        tags.add("passing_touchdowns")
+
+    if (
+        "passing yards" in combined
+        or "football_player_passing_yards" in combined
+    ):
+        tags.add("passing_yards")
+
+    if (
+        "receiving yards" in combined
+        or "football_player_receiving_yards" in combined
+    ):
+        tags.add("receiving_yards")
+
+    if (
+        "rushing yards" in combined
+        or "football_player_rushing_yards" in combined
+    ):
+        tags.add("rushing_yards")
+
+    if (
+        "receptions" in combined
+        or "football_player_receptions" in combined
+    ):
+        tags.add("receptions")
+
+    # Kalshi KXNFLTD refers to the player personally scoring a touchdown,
+    # which is different from a QB recording a passing touchdown.
+    if market.market_id.upper().startswith("KXNFLTD"):
+        tags.add("touchdowns_scored")
+
+    return tags
+
+
+def _semantic_contracts_compatible(a: Market, b: Market) -> bool:
+    a_tags = _semantic_contract_tags(a)
+    b_tags = _semantic_contract_tags(b)
+
+    # Award proposition vs statistical-leader proposition
+    if (
+        "award" in a_tags
+        and "stat_leader" in b_tags
+    ) or (
+        "award" in b_tags
+        and "stat_leader" in a_tags
+    ):
+        return False
+
+    # Finalist and winner are not equivalent.
+    if (
+        "award_finalist" in a_tags
+        and "award_winner" in b_tags
+    ) or (
+        "award_finalist" in b_tags
+        and "award_winner" in a_tags
+    ):
+        return False
+
+    specific_stats = {
+        "most_receiving_yards",
+        "most_rushing_yards",
+        "most_passing_yards",
+        "most_receptions",
+        "most_passing_touchdowns",
+        "passing_touchdowns",
+        "passing_yards",
+        "receiving_yards",
+        "rushing_yards",
+        "receptions",
+        "touchdowns_scored",
+    }
+
+    a_specific = a_tags & specific_stats
+    b_specific = b_tags & specific_stats
+
+    if (
+        a_specific
+        and b_specific
+        and a_specific.isdisjoint(b_specific)
+    ):
+        return False
+
+    return True
 
 
 def _looks_completed(market: Market) -> bool:
@@ -158,6 +310,12 @@ def auto_match_markets(
                 k_market,
                 p_market,
             ):
+                continue
+
+            if not _contracts_compatible(k_market, p_market):
+                continue
+
+            if not _semantic_contracts_compatible(k_market, p_market):
                 continue
 
             _, text, date, category = score_pair(

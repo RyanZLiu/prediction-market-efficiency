@@ -101,7 +101,7 @@ def _age_seconds(timestamp: datetime | None) -> float | None:
     return max(0.0, (datetime.now(UTC) - timestamp).total_seconds())
 
 
-@st.fragment(run_every="1s")
+@st.fragment(run_every=0.25)
 def live_panel() -> None:
     status = tracker.status()
     current_event_ids = tracker.current_event_ids()
@@ -213,6 +213,11 @@ def live_panel() -> None:
         f"Status: {phase} · discovered {status['kalshi_markets']:,} Kalshi + "
         f"{status['polymarket_markets']:,} Polymarket US markets · map refreshed "
         f"{_format_age(status['last_market_refresh'])}"
+    )
+    st.caption(
+        "Feed updates: "
+        f"Kalshi {_format_age(status.get('last_kalshi_quote'))} · "
+        f"Polymarket US {_format_age(status.get('last_polymarket_quote'))}"
     )
     if last_error:
         st.warning(f"Tracker warning: {last_error}")
@@ -411,7 +416,7 @@ def live_panel() -> None:
     display["K change age (s)"] = display["k_age_s"]
     display["P change age (s)"] = display["p_age_s"]
     display["Change skew (s)"] = display["quote_skew_s"]
-    display["Feed activity"] = display["quote_gate"]
+    display["Feed activity"] = display["feed_activity"]
     display["Rules"] = display["rules_verified"].map(
         {
             True: "✅ VERIFIED",
